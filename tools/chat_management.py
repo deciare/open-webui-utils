@@ -1,7 +1,7 @@
 """
 title: Chat & Folder Management
 author: Airi V
-version: 1.2.1
+version: 1.2.2
 description: A complete suite of tools for organising conversations — rename, archive, move between folders,
              create/rename/delete folders, and advanced chat search with folder-aware filtering.
              Works in both normal chat and Automation contexts.
@@ -676,6 +676,7 @@ class Tools:
         start_timestamp: Optional[int] = None,
         end_timestamp: Optional[int] = None,
         __user__: dict = None,
+        __chat_id__: str = None,
     ) -> str:
         """
         Advanced chat search with folder-aware filtering.
@@ -739,6 +740,11 @@ class Tools:
 
             results = []
             for chat in chats:
+                # Skip the current chat to avoid showing it in search results.
+                # This matches the behaviour of the built-in search_chats tool.
+                if __chat_id__ and chat.id == __chat_id__:
+                    continue
+
                 # Post-filter: include only specific folder
                 if include_folder_id is not None and chat.folder_id != include_folder_id:
                     continue
