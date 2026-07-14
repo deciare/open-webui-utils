@@ -2655,6 +2655,10 @@ RESPONSE REQUIREMENTS:
         you MUST NOT perform it yourself. Delegate to this tool immediately.
         Only handle simple 1-2 tool call tasks yourself. When in doubt, delegate.
 
+        The sub-agent may not have access to tools that make changes, such as `run_command`, `add_memory`, `write_file`, etc.
+        Avoid spawning sub-agents for making changes; make changes yourself while relying on
+        sub-agents for investigation and complex analysis.
+
         The sub-agent runs in a fresh context with NO access to the current
         conversation history — include all necessary context in the prompt.
         It has the same tools and executes them in a loop until completion,
