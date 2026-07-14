@@ -1,5 +1,5 @@
 """
-title: Memories in Automation Context
+title: Memories in Automation Context (for Open WebUI 0.9.6)
 author: Airi V
 version: 1.1.0
 description: A complete suite of tools giving the LLM precise control over long-term user memories.
