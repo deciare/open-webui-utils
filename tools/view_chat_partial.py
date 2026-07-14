@@ -2,7 +2,7 @@
 title: view_chat_partial
 author: Airi V
 description: View portions of a chat conversation — last N messages, messages within a time range, or a specific paginated range. Always gates access to the current user's own chats.
-version: 1.1.0
+version: 1.2.0
 """
 
 from typing import Optional
@@ -167,6 +167,13 @@ class Tools:
             if ts_str:
                 header += f"  _{ts_str}_"
 
+            # --- v0.10+ output array format ---
+            # If content is empty, try reconstructing from the structured output array
+            if not content:
+                output_arr = msg.get("output")
+                if isinstance(output_arr, list) and output_arr:
+                    content = self._reconstruct_from_output_array(output_arr)
+
             # Handle content that might be a list (multi-part messages)
             if isinstance(content, list):
                 text_parts = [
@@ -185,6 +192,128 @@ class Tools:
             lines.append("")
 
         return "\n".join(lines) + cap_note
+
+    @staticmethod
+    def _html_entity_encode(s: str) -> str:
+        """HTML-entity encode a string for safe use as an XML/HTML attribute value."""
+        return (
+            s
+            .replace("&", "&amp;")
+            .replace('"', "&quot;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("'", "&#39;")
+        )
+
+    @staticmethod
+    def _reconstruct_from_output_array(output_arr: list) -> str:
+        """
+        Reconstruct a human-readable content string from the v0.10+
+        structured `output` array format.
+
+        The output array contains typed items:
+          - "message": text content [{type: "output_text", text: "..."}]
+          - "function_call": tool invocation with id, call_id, name, arguments
+          - "function_call_output": tool result linked by call_id
+          - "reasoning": reasoning/chain-of-thought blocks
+
+        Tool calls are rendered as <details type="tool_calls"> blocks
+        (compatible with Open WebUI's ToolCallParser) so they appear as
+        interactive cards rather than raw JSON.
+
+        Returns empty string if the output array has no usable content.
+        """
+        # First pass: build call_id → result text map from function_call_output
+        results_by_call_id: dict[str, str] = {}
+        for item in output_arr:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function_call_output":
+                call_id = item.get("call_id", "")
+                output_items = item.get("output")
+                if isinstance(output_items, list) and call_id:
+                    texts = [
+                        o.get("text", "")
+                        for o in output_items
+                        if isinstance(o, dict) and o.get("text")
+                    ]
+                    result = "\n".join(t for t in texts if t)
+                    if result:
+                        results_by_call_id[call_id] = result
+
+        # Second pass: build content string in order
+        parts: list[str] = []
+        for item in output_arr:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type", "")
+
+            if item_type == "message":
+                content_arr = item.get("content")
+                if isinstance(content_arr, list):
+                    texts = [
+                        piece.get("text", "")
+                        for piece in content_arr
+                        if isinstance(piece, dict) and piece.get("text")
+                    ]
+                    text = "\n".join(t for t in texts if t)
+                    if text:
+                        parts.append(text)
+
+            elif item_type == "function_call":
+                name = item.get("name", "")
+                if not name:
+                    continue
+                call_id = item.get("call_id") or item.get("id") or ""
+                item_id = item.get("id") or call_id
+                status = item.get("status", "completed")
+                done = "true" if status == "completed" else "false"
+                arguments = item.get("arguments", "")
+                encoded_args = Tools._html_entity_encode(arguments)
+                result_text = results_by_call_id.get(call_id, "")
+
+                if result_text:
+                    encoded_result = Tools._html_entity_encode(result_text)
+                    block = (
+                        f'<details type="tool_calls" id="{item_id}" '
+                        f'name="{name}" done="{done}" '
+                        f'arguments="{encoded_args}" '
+                        f'result="{encoded_result}">\n'
+                        f'<summary>Tool Executed</summary>\n'
+                        f'{result_text}\n'
+                        f'</details>'
+                    )
+                else:
+                    block = (
+                        f'<details type="tool_calls" id="{item_id}" '
+                        f'name="{name}" done="{done}" '
+                        f'arguments="{encoded_args}">\n'
+                        f'<summary>Tool Executed</summary>\n'
+                        f'</details>'
+                    )
+                parts.append(block)
+
+            elif item_type == "reasoning":
+                content_arr = item.get("content")
+                if isinstance(content_arr, list):
+                    texts = [
+                        piece.get("text", "")
+                        for piece in content_arr
+                        if isinstance(piece, dict) and piece.get("text")
+                    ]
+                    reasoning_text = "\n".join(t for t in texts if t)
+                    if reasoning_text:
+                        block = (
+                            '<details type="reasoning" done="true">\n'
+                            '<summary>Thinking</summary>\n'
+                            f'{reasoning_text}\n'
+                            '</details>'
+                        )
+                        parts.append(block)
+
+            # Skip function_call_output (consumed in first pass) and unknown types
+
+        return "\n\n".join(parts) if parts else ""
 
     @staticmethod
     def _walk_history(messages_map: dict, start_id: str | None) -> list[dict]:
