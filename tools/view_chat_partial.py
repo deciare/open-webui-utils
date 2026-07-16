@@ -2,7 +2,7 @@
 title: view_chat_partial
 author: Airi V
 description: View portions of a chat conversation — last N messages, messages within a time range, or a specific paginated range. Supports contextual expansion around matched results (before_n / after_n). Always gates access to the current user's own chats.
-version: 1.3.0
+version: 1.3.1
 """
 
 from typing import Optional
@@ -387,15 +387,27 @@ class Tools:
 
             if chain:
                 chain.reverse()
-                # Any messages not in the chain (orphans) get appended at the end
-                chain_ids = set(m.get("id") for m in chain)
-                orphans = [
-                    msg for mid, msg in messages_map.items()
-                    if mid not in chain_ids and isinstance(msg, dict) and msg.get("role")
-                ]
-                if orphans:
-                    orphans.sort(key=lambda m: m.get("timestamp", 0))
-                    chain.extend(orphans)
+                # Orphan messages (edits, regens, cancelled streams) are excluded.
+                # They exist in messages_map but aren't reachable via the parent
+                # chain from currentId. Including them skews last_n, before_n,
+                # and from_index because they steal positions from the real tail.
+                # The built-in view_chat also excludes orphans: it only walks
+                # the parent chain and returns what it finds there.
+                #
+                # See: builtin.py view_chat (lines ~1311-1332)
+                #
+                # If this causes problems (e.g. legitimate messages being lost),
+                # uncomment the block below to restore the old behavior:
+                #
+                #     chain_ids = set(m.get("id") for m in chain)
+                #     orphans = [
+                #         msg for mid, msg in messages_map.items()
+                #         if mid not in chain_ids and isinstance(msg, dict) and msg.get("role")
+                #     ]
+                #     if orphans:
+                #         orphans.sort(key=lambda m: m.get("timestamp", 0))
+                #         chain.extend(orphans)
+
                 return chain
 
         # Fallback: just sort everything by timestamp
