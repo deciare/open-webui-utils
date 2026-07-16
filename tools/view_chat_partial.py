@@ -1,7 +1,7 @@
 """
 title: view_chat_partial
 author: Airi V
-description: View portions of a chat conversation — last N messages, messages within a time range, or a specific paginated range. Always gates access to the current user's own chats.
+description: View portions of a chat conversation — last N messages, messages within a time range, or a specific paginated range. Supports contextual expansion around matched results (before_n / after_n). Always gates access to the current user's own chats.
 version: 1.2.0
 """
 
@@ -38,6 +38,8 @@ class Tools:
         from_index: Optional[int] = None,
         count: Optional[int] = None,
         roles: Optional[str] = None,
+        before_n: Optional[int] = None,
+        after_n: Optional[int] = None,
         __user__: dict = None,
     ) -> str:
         """
@@ -46,6 +48,13 @@ class Tools:
         - start_timestamp / end_timestamp: get messages within a time range (Unix seconds). If start_timestamp is omitted, includes messages from the start of the chat. If end_timestamp is omitted, includes messages up to the end of the chat.
         - from_index + count: paginated access to the full history (after ordering chronologically)
         - roles: comma-separated list of roles to include (e.g. "user,assistant"). If omitted, all roles are returned.
+        - before_n: include N messages preceding the first result as context
+        - after_n: include N messages following the last result as context
+
+        Context parameters (before_n / after_n) operate like grep's -B and -A:
+        they pull from the full conversation, bypassing role and timestamp filters.
+        This means context messages may include roles or timestamps that the
+        primary filters exclude.
 
         All access is gated to the authenticated user's own chats.
 
@@ -56,6 +65,8 @@ class Tools:
         :param from_index: 0-based index to start returning messages from (after ordering chronologically).
         :param count: Maximum number of messages to return. Used with from_index for pagination, or alone to cap output.
         :param roles: Comma-separated list of roles to include (e.g. "user,assistant").
+        :param before_n: Number of messages preceding the first result to include as context.
+        :param after_n: Number of messages following the last result to include as context.
         """
 
         if Chats is None:
@@ -93,12 +104,14 @@ class Tools:
         if not messages_map:
             return f"Chat '{chat.title or chat_id}' has no messages."
 
-        # Build an ordered list by walking the parent chain from currentId
+        # Build an ordered list by walking the parent chain from currentId.
+        # full_ordered is preserved for context expansion; 'ordered' is filtered.
         current_id = history.get("currentId")
-        ordered = self._walk_history(messages_map, current_id)
-        total_messages = len(ordered)
+        full_ordered = self._walk_history(messages_map, current_id)
+        total_messages = len(full_ordered)
 
         # --- Apply filters ---
+        ordered = full_ordered[:]
 
         # Filter by roles
         if roles and isinstance(roles, str):
@@ -127,6 +140,38 @@ class Tools:
             end = start + count if count is not None and isinstance(count, int) else len(ordered)
             ordered = ordered[start:end]
 
+        # --- Context expansion ---
+        # before_n / after_n expand around the result boundaries in the full
+        # (unfiltered) ordered list, matching grep's -B / -A semantics: context
+        # lines may not match the filter criteria but provide surrounding context.
+        context_before_count = 0
+        context_after_count = 0
+        if ordered and ((before_n is not None and before_n > 0) or (after_n is not None and after_n > 0)):
+            # Build position map for the full ordered list
+            full_id_to_pos = {}
+            for i, m in enumerate(full_ordered):
+                mid = m.get("id")
+                if mid is not None:
+                    full_id_to_pos[mid] = i
+
+            first_pos = full_id_to_pos.get(ordered[0].get("id"))
+            last_pos = full_id_to_pos.get(ordered[-1].get("id"))
+
+            context_before = []
+            context_after = []
+
+            if first_pos is not None and before_n and before_n > 0:
+                ctx_start = max(0, first_pos - before_n)
+                context_before = full_ordered[ctx_start:first_pos]
+                context_before_count = len(context_before)
+
+            if last_pos is not None and after_n and after_n > 0:
+                ctx_end = min(len(full_ordered), last_pos + 1 + after_n)
+                context_after = full_ordered[last_pos + 1:ctx_end]
+                context_after_count = len(context_after)
+
+            ordered = context_before + ordered + context_after
+
         # Apply hard cap from valves
         if len(ordered) > self.valves.max_messages:
             overflow = len(ordered) - self.valves.max_messages
@@ -143,7 +188,10 @@ class Tools:
         if len(ordered) == total_messages:
             lines.append(f"Messages returned: {len(ordered)}")
         else:
-            lines.append(f"Messages returned: {len(ordered)} of {total_messages}")
+            msg_line = f"Messages returned: {len(ordered)} of {total_messages}"
+            if context_before_count or context_after_count:
+                msg_line += f" ({context_before_count} before, {context_after_count} after context)"
+            lines.append(msg_line)
         if start_timestamp:
             dt = datetime.fromtimestamp(start_timestamp, tz=timezone.utc).isoformat()
             lines.append(f"From: {dt}")
