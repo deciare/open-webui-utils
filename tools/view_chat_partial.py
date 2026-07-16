@@ -2,7 +2,7 @@
 title: view_chat_partial
 author: Airi V
 description: View portions of a chat conversation — last N messages, messages within a time range, or a specific paginated range. Supports contextual expansion around matched results (before_n / after_n). Always gates access to the current user's own chats.
-version: 1.2.0
+version: 1.3.0
 """
 
 from typing import Optional
