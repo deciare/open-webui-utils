@@ -1,7 +1,7 @@
 """
 title: Chat & Folder Management
 author: Airi V
-version: 1.2.2
+version: 1.2.3
 description: A complete suite of tools for organising conversations — rename, archive, move between folders,
              create/rename/delete folders, and advanced chat search with folder-aware filtering.
              Works in both normal chat and Automation contexts.
@@ -10,6 +10,14 @@ description: A complete suite of tools for organising conversations — rename, 
              (delete_chat / delete_folder) without losing the rest of the tool.
              Supports subfolders — every folder-name-based method accepts parent_folder_name for
              disambiguation when the same folder name exists at different levels.
+
+             v1.2.3: search_chats_advanced no longer crashes on empty query + timestamp filters.
+                     Uses get_chats_by_user_id (full ChatModel) instead of
+                     get_chats_by_user_id_and_search_text (falls back to ChatTitleIdResponse
+                     on empty input, which lacks folder_id and chat fields).
+
+             v1.2.2: search_chats_advanced now accepts __chat_id__ and skips the current chat,
+                     matching built-in search_chats behaviour.
 """
 
 import json
@@ -730,13 +738,31 @@ class Tools:
 
             # Broad fetch — post-filter by folder rather than relying on the
             # built-in search's folder: prefix, which breaks on multi-word names.
-            chats = await Chats.get_chats_by_user_id_and_search_text(
-                user_id=user_id,
-                search_text=query,
-                include_archived=include_archived,
-                skip=0,
-                limit=count * 3,
-            )
+            #
+            # NOTE: get_chats_by_user_id_and_search_text falls back to
+            # get_chat_list_by_user_id when search_text is empty, which returns
+            # ChatTitleIdResponse objects WITHOUT folder_id or chat fields.
+            # Use get_chats_by_user_id — which returns full ChatModel objects —
+            # for the empty-query case instead.
+            if query and query.strip():
+                chats = await Chats.get_chats_by_user_id_and_search_text(
+                    user_id=user_id,
+                    search_text=query,
+                    include_archived=include_archived,
+                    skip=0,
+                    limit=count * 3,
+                )
+            else:
+                result = await Chats.get_chats_by_user_id(
+                    user_id=user_id,
+                    filter={"order_by": "updated_at", "direction": "desc"},
+                    skip=0,
+                    limit=count * 3,
+                )
+                chats = [
+                    c for c in result.items
+                    if include_archived or not c.archived
+                ]
 
             results = []
             for chat in chats:
