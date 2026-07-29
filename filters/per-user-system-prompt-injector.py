@@ -1,7 +1,7 @@
 """
 title: Per-User System Prompt Injector
 author: Airi V
-version: 0.3.0
+version: 0.3.3
 description: >
   Constructs a system prompt from up to 10 designated prompt files
   (filesystem or knowledge base), then combines it with the model-level
@@ -86,12 +86,12 @@ class Filter:
     The ``MODEL_POSITION`` valve (admin-configured) accepts:
 
     ``prepend``
-        Model+user prompt → files.  The model and user prompts
+        Files → model+user prompt.  The model and user prompts
         (already merged in model → user order by Open WebUI) are
         placed before the file-assembled prompt.
 
     ``append``
-        Files → model+user prompt.  The model and user prompts are
+        Model+user prompt → files.  The model and user prompts are
         placed after the file-assembled prompt.
 
     ``replace``
@@ -115,6 +115,14 @@ class Filter:
                 "Where to place the model+user system prompt relative to "
                 "the file-assembled prompt: 'prepend', 'append', or "
                 "'replace' (files only — model+user discarded)."
+            ),
+        )
+        DEBUG: bool = Field(
+            default=False,
+            description=(
+                "Enable verbose diagnostic logging.  Turn on to trace "
+                "file resolution and prompt assembly; turn off in "
+                "production to keep logs quiet."
             ),
         )
 
@@ -169,6 +177,15 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
+
+    # ── Helpers: debug logging ──────────────────────────────────────
+
+    def _debug(self, msg: str, *args, level: str = "info"):
+        """Log a diagnostic message only when the DEBUG valve is enabled."""
+        if not getattr(self.valves, "DEBUG", False):
+            return
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(msg, *args)
 
     # ── Helpers: file reading ─────────────────────────────────────────
 
@@ -273,23 +290,68 @@ class Filter:
             return None
 
         from open_webui.models.knowledge import Knowledges
+        from open_webui.models.models import Models
 
-        model_knowledge = (
-            __model__.get("info", {})
-            .get("meta", {})
-            .get("knowledge", [])
+        # Get knowledge items directly from the DB instead of from
+        # __model__["info"]["meta"]["knowledge"].
+        #
+        # Since 0.11.0 (commit #27287), the model list strips
+        # extracted file content from knowledge items stored in
+        # __model__.  The *structural* fields (type, id) are
+        # preserved, but querying the DB is more robust against
+        # future changes and doesn't depend on the model list
+        # serialisation path.
+        model_id = __model__.get("id") if __model__ else None
+        if not model_id:
+            self._debug(
+                "PUSPI: _read_file has no model_id; aborting KB lookup",
+                level="warning",
+            )
+            return None
+
+        self._debug(
+            "PUSPI: _read_file looking up KB for path=%r model_id=%s",
+            stripped, model_id,
         )
+
+        result = await Models.get_model_meta_by_id(model_id)
+        if not result:
+            self._debug(
+                "PUSPI: get_model_meta_by_id returned None for model_id=%s",
+                model_id,
+                level="warning",
+            )
+            return None
+
+        model_meta = result[0] or {}
+        model_knowledge = model_meta.get("knowledge", [])
+        self._debug(
+            "PUSPI: model_meta has %d knowledge items",
+            len(model_knowledge) if isinstance(model_knowledge, list) else -1,
+        )
+
         if not model_knowledge:
+            self._debug(
+                "PUSPI: model_knowledge is empty/falsy",
+                level="warning",
+            )
             return None
 
         # Collect knowledge base IDs from attached collections
         kb_ids: List[str] = []
         for item in model_knowledge:
+            if not isinstance(item, dict):
+                continue
             if item.get("type") == "collection":
                 kb_ids.append(item.get("id"))
             elif item.get("collection_name"):
                 # Legacy single-collection attachment
                 kb_ids.append(item.get("collection_name"))
+
+        self._debug(
+            "PUSPI: found %d collection KB IDs: %s",
+            len(kb_ids), kb_ids,
+        )
             # Note: collection_names (multi-collection legacy) is
             # an array; we could iterate those too, but for
             # simplicity we skip them — multi-collection legacy
@@ -301,15 +363,30 @@ class Filter:
 
             try:
                 path_map = await self._resolve_kb_file_paths(kb_id)
+                self._debug(
+                    "PUSPI: KB %s has %d files; looking for path=%r",
+                    kb_id, len(path_map), stripped,
+                )
                 file_id = path_map.get(stripped)
                 if file_id:
                     content = await self._read_knowledge_file(file_id)
                     if content:
-                        logger.debug(
-                            "Read file from knowledge base %s: %s",
-                            kb_id, stripped,
+                        self._debug(
+                            "PUSPI: FOUND file %r in KB %s (%d chars)",
+                            stripped, kb_id, len(content),
                         )
                         return content
+                    else:
+                        self._debug(
+                            "PUSPI: file_id=%s has no content", file_id,
+                            level="warning",
+                        )
+                else:
+                    self._debug(
+                        "PUSPI: path %r NOT in KB %s (available: %s)",
+                        stripped, kb_id,
+                        sorted(path_map.keys())[:20],
+                    )
             except Exception:
                 logger.warning(
                     "Failed to search knowledge base %s for %s",
@@ -317,7 +394,10 @@ class Filter:
                 )
                 continue
 
-        logger.debug("File not found in any attached KB: %s", stripped)
+        self._debug(
+            "PUSPI: file %r not found in any attached KB", stripped,
+            level="warning",
+        )
         return None
 
     # ── Prompt assembly ───────────────────────────────────────────────
@@ -356,14 +436,14 @@ class Filter:
             if file_prompt:
                 parts.append(file_prompt)
 
-        elif position == "append":
+        elif position == "prepend":
             # Files → model+user
             if file_prompt:
                 parts.append(file_prompt)
             if model_user_prompt:
                 parts.append(model_user_prompt)
 
-        else:  # "prepend" (default)
+        else:  # "append" (default)
             # Model+user → files
             if model_user_prompt:
                 parts.append(model_user_prompt)
@@ -407,9 +487,12 @@ class Filter:
             "email", __user__.get("name", user_id),
         )
 
-        logger.info(
-            "Per-user prompt injector (filter): user=%s (%s)",
-            user_id, user_label,
+        model_id: str = __model__.get("id", "unknown") if __model__ else "N/A"
+        model_owned_by: str = __model__.get("owned_by", "?") if __model__ else "N/A"
+        self._debug(
+            "PUSPI inlet: user=%s (%s) model=%s owned_by=%s has_user_valves=%s",
+            user_id, user_label, model_id, model_owned_by,
+            __user__.get("valves") is not None,
         )
 
         # ── Retrieve UserValves for this request ──────────────────
@@ -419,7 +502,24 @@ class Filter:
         # is shared across requests).
         user_valves = __user__.get("valves")
         if user_valves is None:
+            self._debug(
+                "PUSPI: no UserValves on __user__; using defaults",
+                level="warning",
+            )
             user_valves = self.UserValves()
+        else:
+            active_files = [
+                key for key in _FILE_KEYS
+                if getattr(user_valves, key, "").strip()
+            ]
+            self._debug(
+                "PUSPI: UserValves active files: %s",
+                active_files if active_files else "(none)",
+            )
+            for key in active_files:
+                self._debug(
+                    "PUSPI: %s = %r", key, getattr(user_valves, key, "")
+                )
 
         # ── Extract the existing system message ──────────────────
         # By the time inlet filters run, Open WebUI middleware has
@@ -440,6 +540,7 @@ class Filter:
         # ── Assemble the file prompt ────────────────────────────
         file_prompt: Optional[str] = None
         if __model__ is not None:
+            self._debug("PUSPI: assembling file prompt (model_id=%s)", model_id)
             file_prompt = await self._assemble_file_prompt(
                 user_valves, __model__,
             )
@@ -447,6 +548,12 @@ class Filter:
             logger.warning(
                 "__model__ not available; skipping file prompt assembly",
             )
+
+        self._debug(
+            "PUSPI: file_prompt length=%d, model_user_prompt length=%d",
+            len(file_prompt) if file_prompt else 0,
+            len(model_user_prompt) if model_user_prompt else 0,
+        )
 
         # ── Combine and inject ──────────────────────────────────
         final_prompt = self._combine_prompts(model_user_prompt, file_prompt)
@@ -459,25 +566,32 @@ class Filter:
             else:
                 messages.insert(0, new_system)
 
-            logger.info(
-                "Injected system prompt for user=%s (%d chars total)",
-                user_label, len(final_prompt),
+            position = getattr(self.valves, "MODEL_POSITION", "prepend")
+            self._debug(
+                "PUSPI: INJECTED system prompt for user=%s position=%s "
+                "(%d chars total, file=%d, model_user=%d)",
+                user_label, position, len(final_prompt),
+                len(file_prompt) if file_prompt else 0,
+                len(model_user_prompt) if model_user_prompt else 0,
             )
         elif file_prompt is None and model_user_prompt is not None:
             # No files, and model+user prompt is already in place —
             # nothing to do
-            logger.info(
-                "No file prompt for user=%s; leaving existing system "
-                "prompt unchanged",
+            self._debug(
+                "PUSPI: NO FILE PROMPT for user=%s; leaving unchanged "
+                "(model_user_prompt=%d chars)",
                 user_label,
+                len(model_user_prompt) if model_user_prompt else 0,
+                level="warning",
             )
         elif system_idx is not None and file_prompt is None:
             # replace position with no files → remove system message
             del messages[system_idx]
-            logger.info(
-                "No file prompt and position=replace; removed system "
-                "prompt for user=%s",
+            self._debug(
+                "PUSPI: position=replace with no file prompt; "
+                "REMOVED system prompt for user=%s",
                 user_label,
+                level="warning",
             )
 
         return body
