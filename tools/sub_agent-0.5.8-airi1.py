@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000 (modified by Airi V)
-version: 0.5.7-airi1
+version: 0.5.8-airi1
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -110,6 +110,14 @@ BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
         "update_calendar_event",
         "delete_calendar_event",
     },
+    "files": {
+        "list_chat_files",
+        "query_chat_files",
+        "grep_chat_files",
+        "view_file",
+    },
+    "subagents": {"delegate_task", "timer"},
+    "notifications": {"notify"},
 }
 
 
@@ -140,6 +148,9 @@ VALVE_TO_CATEGORY: dict[str, list[str]] = {
     "ENABLE_AUTOMATION_WRITE_TOOLS": ["automations_write"],
     "ENABLE_CALENDAR_READ_TOOLS": ["calendar_read"],
     "ENABLE_CALENDAR_WRITE_TOOLS": ["calendar_write"],
+    "ENABLE_FILE_TOOLS": ["files"],
+    "ENABLE_SUBAGENT_TOOLS": ["subagents"],
+    "ENABLE_NOTIFICATION_TOOLS": ["notifications"],
 }
 
 # --- inlined from src/owui_ext/shared/completion_response.py (owui_ext.shared.completion_response) ---
@@ -222,6 +233,7 @@ def format_chat_completion_error(response: Any) -> Optional[str]:
 
 
 # --- inlined from src/owui_ext/shared/inlet_filters.py (owui_ext.shared.inlet_filters) ---
+import inspect
 import logging
 from typing import Any
 from fastapi import Request
@@ -271,12 +283,19 @@ async def apply_inlet_filters_if_enabled(
             )
             if function:
                 filter_functions.append(function)
+        process_kwargs: dict[str, Any] = {
+            "request": request,
+            "filter_functions": filter_functions,
+            "filter_type": "inlet",
+            "form_data": form_data,
+            "extra_params": local_extra_params,
+        }
+        if "filter_context" in inspect.signature(
+            process_filter_functions
+        ).parameters:
+            process_kwargs["filter_context"] = None
         form_data, _ = await process_filter_functions(
-            request=request,
-            filter_functions=filter_functions,
-            filter_type="inlet",
-            form_data=form_data,
-            extra_params=local_extra_params,
+            **process_kwargs,
         )
     except Exception as exc:
         _inlet_filters_log.warning(f"Error applying inlet filters: {exc}")
@@ -287,15 +306,50 @@ async def apply_inlet_filters_if_enabled(
 from typing import Optional
 
 
-def model_has_note_knowledge(model: Optional[dict]) -> bool:
-    """Return True if the current model has note-type attached knowledge."""
+def _attached_knowledge_types(
+    model: Optional[dict],
+    metadata: Optional[dict] = None,
+) -> set[str]:
     if not isinstance(model, dict):
-        return False
-    knowledge_items = model.get("info", {}).get("meta", {}).get("knowledge") or []
-    if not isinstance(knowledge_items, list):
-        return False
-    return any(
-        item.get("type") == "note" for item in knowledge_items if isinstance(item, dict)
+        model = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    model_meta = model.get("info", {}).get("meta", {})
+    knowledge_items = list(model_meta.get("knowledge") or [])
+    knowledge_items.extend(metadata.get("folder_knowledge") or [])
+    if not (model_meta.get("capabilities") or {}).get("file_context", True):
+        knowledge_items.extend(
+            item
+            for item in metadata.get("files") or []
+            if isinstance(item, dict)
+            and item.get("type") in ("collection", "note")
+        )
+
+    return {
+        item["type"]
+        for item in knowledge_items
+        if isinstance(item, dict)
+        and isinstance(item.get("type"), str)
+        and item.get("id")
+    }
+
+
+def model_has_note_knowledge(
+    model: Optional[dict],
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Return True if Core can expose view_note for attached knowledge."""
+    return "note" in _attached_knowledge_types(model, metadata)
+
+
+def model_has_file_knowledge(
+    model: Optional[dict],
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Return True if Core can expose view_file for attached knowledge."""
+    return not _attached_knowledge_types(model, metadata).isdisjoint(
+        {"file", "collection"}
     )
 
 
@@ -416,6 +470,7 @@ CITATION_TOOLS: set[str] = {
     "search_web",
     "view_file",
     "view_knowledge_file",
+    "query_chat_files",
     "query_knowledge_files",
     "fetch_url",
 }
@@ -1336,6 +1391,13 @@ async def build_tools_dict(
     except Exception:
         get_terminal_tools = None
 
+    try:
+        from open_webui.utils.tools import (
+            get_attached_knowledge as core_get_attached_knowledge,
+        )
+    except ImportError:
+        core_get_attached_knowledge = None
+
     metadata = metadata or {}
     extra_params = extra_params or {}
     model = model or {}
@@ -1587,8 +1649,14 @@ async def build_tools_dict(
 
         knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
         knowledge_read_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_READ_TOOLS", True))
+        file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))
         notes_master_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
         notes_read_enabled = bool(getattr(valves, "ENABLE_NOTES_READ_TOOLS", True))
+        knowledge_metadata = (
+            metadata
+            if core_get_attached_knowledge is not None
+            else {"folder_knowledge": metadata.get("folder_knowledge")}
+        )
         # view_note keeps its escape hatch: if notes read is disabled but the
         # model has attached note-type knowledge, view_note is still needed
         # to access that knowledge
@@ -1597,14 +1665,24 @@ async def build_tools_dict(
             and knowledge_tools_enabled
             and knowledge_read_enabled
             and model_knowledge_tools_enabled(model)
-            and model_has_note_knowledge(model)
+            and model_has_note_knowledge(model, knowledge_metadata)
+        )
+        keep_view_file = (
+            file_tools_enabled and "list_chat_files" in all_builtin_tools
+        ) or (
+            knowledge_tools_enabled
+            and knowledge_read_enabled
+            and model_knowledge_tools_enabled(model)
+            and "kb_exec" not in all_builtin_tools
+            and model_has_file_knowledge(model, knowledge_metadata)
         )
 
         # Regular tools take priority over builtin tools with the same name.
         builtin_count = 0
         for name, tool_dict in all_builtin_tools.items():
             if name in disabled_builtin_tools and not (
-                name == "view_note" and keep_view_note_for_knowledge
+                (name == "view_note" and keep_view_note_for_knowledge)
+                or (name == "view_file" and keep_view_file)
             ):
                 continue
             if name not in tools_dict:
@@ -2474,6 +2552,14 @@ class Tools:
             default=True,
             description="Enable image generation tools (generate_image, edit_image).",
         )
+        ENABLE_FILE_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Core tools for listing, searching, and reading files attached to the current chat "
+                "(list_chat_files, query_chat_files, grep_chat_files, view_file). Files exposed through "
+                "attached knowledge remain controlled by ENABLE_KNOWLEDGE_TOOLS."
+            ),
+        )
         ENABLE_KNOWLEDGE_TOOLS: bool = Field(
             default=True,
             description="Enable knowledge base tools (list/search/query knowledge bases and files).",
@@ -2509,6 +2595,14 @@ class Tools:
             default=True,
             description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, the sub-agent can view skill contents.",
         )
+        ENABLE_SUBAGENT_TOOLS: bool = Field(
+            default=False,
+            description=(
+                "Enable Core subagent tools (delegate_task, timer). Off by default because they use the "
+                "parent conversation's model and tools rather than this agent's restrictions, and timer "
+                "can schedule future work for the parent chat."
+            ),
+        )
         ENABLE_TASK_TOOLS: bool = Field(
             default=True,
             description="Enable task management tools (create_tasks, update_task).",
@@ -2520,6 +2614,13 @@ class Tools:
         ENABLE_CALENDAR_TOOLS: bool = Field(
             default=True,
             description="Enable calendar tools (search/create/update/delete calendar events).",
+        )
+        ENABLE_NOTIFICATION_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Core notification tools (notify), which send messages to the user's configured "
+                "notification target."
+            ),
         )
 
         # Read/write sub-toggles for categories that have both read and write tools.
@@ -2655,10 +2756,11 @@ RESPONSE REQUIREMENTS:
         you MUST NOT perform it yourself. Delegate to this tool immediately.
         Only handle simple 1-2 tool call tasks yourself. When in doubt, delegate.
 
+
         The sub-agent may not have access to tools that make changes, such as `run_command`, `add_memory`, `write_file`, etc.
         Avoid spawning sub-agents for making changes; make changes yourself while relying on
         sub-agents for investigation and complex analysis.
-
+        
         The sub-agent runs in a fresh context with NO access to the current
         conversation history — include all necessary context in the prompt.
         It has the same tools and executes them in a loop until completion,
