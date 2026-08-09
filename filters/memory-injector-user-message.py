@@ -2,7 +2,7 @@
 title: Memory Injector — User Message
 author: Airi V
 description: Drop-in replacement for Open WebUI's built-in memory injection (add_memory_context) that renders the same [User Memory] / [Memory Neighborhood] / [Relevant Context] block but injects it into a USER message at a configurable position instead of the system message — keeping the system-message prefix stable for prompt caching. Ported from the v0.11.0 middleware pipeline (utils/memory.py add_memory_context), with the same gates, retrieval, dedup and char limits.
-version: 1.0.2
+version: 1.0.3
 """
 # v1.0.1: default priority 10 (runs after time-awareness, whose parser-based
 # container update breaks when another filter's block is already present); the
@@ -11,13 +11,17 @@ version: 1.0.2
 # v1.0.2: fix 'UserValves' object has no attribute 'get' — the framework
 # injects __user__['valves'] as a pydantic UserValves INSTANCE (utils/filter.py
 # apply_user_valves), not a dict; normalize before reading `enabled`.
+# v1.0.3: container protocol updates in sync with time-awareness v1.2.4-airi9
+# — CREATE prepends the block (user's words later in the window, more weight);
+# the context_end uuid ATTRIBUTE is removed (vestigial locator from the
+# deleted parser path; nothing reads it — the <context_end/> ELEMENT remains
+# as the merge anchor).
 
 import functools
 import html
 import inspect
 import logging
 import sys
-import uuid
 
 from pydantic import BaseModel, Field
 
@@ -171,16 +175,18 @@ CONTEXT_END_TAG = "context_end"
 def _details_container(content: str) -> str:
     """Build a fresh filters_context details block containing `content`.
 
-    The context_end uuid marker is appended for parity with time-awareness.py,
-    whose parser uses it to locate the block's boundary.
+    The `<context_end/>` element is kept as the container's tail anchor:
+    filters merging into an existing block insert their `<context id=...>`
+    element BEFORE it, so the anchor stays last. No uuid attribute — it was
+    a locator for time-awareness's deleted parser path; nothing reads it
+    (sync with time-awareness v1.2.1).
     """
     return (
         '<details type="filters_context">'
         "\n<summary>Filters context</summary>\n"
-        "<!--This context was added by the system to this message, not by the user. "
-        "Message sent on: -->"
+        "<!--This context was added by the system to this message, not by the user. -->"
         f"\n{content}\n"
-        f'<context_end uuid="{str(uuid.uuid4())}"/>\n</details>\n'
+        "<context_end/>\n</details>\n"
     )
 
 
@@ -199,12 +205,15 @@ def get_nth_last_user_message(messages: list, n: int):
     return (messages[idx], idx)
 
 
-def apply_context_to_content(content, context: str, context_id: str):
+def apply_context_to_content(content, context: str, context_id: str, prepend: bool = False):
     """Attach the rendered context block to a message's content.
 
     Handles both plain-string content and OpenAI-style content lists
-    (multimodal parts); the text part is rewritten in place and the
-    filters_context details block is appended at the end.
+    (multimodal parts); the text part is rewritten in place. `prepend=True`
+    (the filter default) creates the filters_context block BEFORE the user's
+    text — same position rule as time-awareness v1.2.0 — so the user's words
+    come later in the window (later context carries more weight). Merges into
+    an existing container happen in place, wherever it sits.
     """
     if isinstance(content, list):
         new_content = list(content)
@@ -218,14 +227,20 @@ def apply_context_to_content(content, context: str, context_id: str):
         )
         if text_idx is not None:
             text = new_content[text_idx].get("text", "")
-            modified = add_or_update_filter_context(text, context, id=context_id)
+            modified = add_or_update_filter_context(
+                text, context, id=context_id, prepend=prepend
+            )
             new_content[text_idx] = {**new_content[text_idx], "text": modified}
         else:
-            modified = add_or_update_filter_context("", context, id=context_id)
+            modified = add_or_update_filter_context(
+                "", context, id=context_id, prepend=prepend
+            )
             new_content.insert(0, {"type": "text", "text": modified})
         return new_content
     else:
-        return add_or_update_filter_context(content, context, id=context_id)
+        return add_or_update_filter_context(
+            content, context, id=context_id, prepend=prepend
+        )
 
 
 def add_or_update_filter_context(
@@ -235,10 +250,12 @@ def add_or_update_filter_context(
     open_tag: str = DETAILS_OPEN_TAG,
     close_tag: str = DETAILS_CLOSE_TAG,
     context_end_tag: str = CONTEXT_END_TAG,
+    prepend: bool = False,
 ) -> str:
-    """Append a filters_context details block to `message`, or merge into the
-    existing one. The caller is responsible for HTML-escaping any arbitrary
-    text placed inside (this filter escapes memory labels at build time).
+    """Append (or prepend, with prepend=True) a filters_context details block
+    to `message`, or merge into the existing one. The caller is responsible
+    for HTML-escaping any arbitrary text placed inside (this filter escapes
+    memory labels at build time).
     """
     context_str = f'<context id="{id}">{context}</context>'
 
@@ -246,8 +263,10 @@ def add_or_update_filter_context(
 
     open_idx = message.find(open_tag)
     if open_idx == -1:
-        # CREATE: no container yet — append one at the end of the message.
+        # CREATE: no container yet — add one at the chosen end of the message.
         block = _details_container(context_str)
+        if prepend:
+            return block + (message + "\n" if message else "")
         return (message + "\n" if message else "") + block
     first_close = message.find(close_tag, open_idx)
     if first_close == -1:
@@ -571,7 +590,7 @@ class Filter:
         if target is None:
             return body
         target["content"] = apply_context_to_content(
-            target["content"], context, self.CONTEXT_ID
+            target["content"], context, self.CONTEXT_ID, prepend=True
         )
         LOGGER.info(
             "Injected memory context into user message at index %d (position n=%d)",

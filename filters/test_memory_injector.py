@@ -260,7 +260,7 @@ async def main():
     last = out["messages"][-1]
     check("current user message got block", has_memory_block(last))
     check("exactly one details block", count_details(last) == 1)
-    check("block appended after user text", str(last["content"]).startswith("Tell me about memory injection."))
+    check("block prepended before user text", str(last["content"]).startswith('<details type="filters_context">'))
     content = str(last["content"])
     check("user section present", "[User Memory]" in content and "amber is her colour" in content)
     check("neighborhood section present", "[Memory Neighborhood]" in content and "Redis config" in content)
