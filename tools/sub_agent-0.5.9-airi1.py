@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000 (modified by Airi V)
-version: 0.5.8-airi1
+version: 0.5.9-airi1
 license: MIT
 required_open_webui_version: 0.7.0
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -38,18 +38,17 @@ from typing import Any, Callable, List, Literal, Optional, Type
 from fastapi import Request
 from pydantic import BaseModel, Field
 
-
 # --- inlined from src/owui_ext/shared/async_utils.py (owui_ext.shared.async_utils) ---
 async def maybe_await(value):
     if hasattr(value, "__await__"):
         return await value
     return value
 
-
 # --- inlined from src/owui_ext/shared/builtin_tools.py (owui_ext.shared.builtin_tools) ---
 BUILTIN_TOOL_CATEGORIES: dict[str, set[str]] = {
     # Unified categories (all-read or all-write, no split needed)
     "time": {"get_current_timestamp", "calculate_timestamp"},
+    "user_input": {"ask_user"},
     "web": {"search_web", "fetch_url"},
     "image_write": {"generate_image", "edit_image"},
     "chat": {"search_chats", "view_chat"},
@@ -157,7 +156,6 @@ VALVE_TO_CATEGORY: dict[str, list[str]] = {
 import json
 from typing import Any, Optional
 from starlette.responses import JSONResponse, Response
-
 _RESPONSE_BODY_PREVIEW_CHARS = 1024
 
 
@@ -231,13 +229,11 @@ def format_chat_completion_error(response: Any) -> Optional[str]:
         return f"API error (status {status}, {type_name}): empty body"
     return f"Unexpected response type: {type(response).__name__}"
 
-
 # --- inlined from src/owui_ext/shared/inlet_filters.py (owui_ext.shared.inlet_filters) ---
 import inspect
 import logging
 from typing import Any
 from fastapi import Request
-
 _inlet_filters_log = logging.getLogger("owui_ext.shared.inlet_filters")
 
 
@@ -278,9 +274,7 @@ async def apply_inlet_filters_if_enabled(
         )
         filter_functions = []
         for filter_id in filter_ids:
-            function = await _inlet_filters_maybe_await(
-                Functions.get_function_by_id(filter_id)
-            )
+            function = await _inlet_filters_maybe_await(Functions.get_function_by_id(filter_id))
             if function:
                 filter_functions.append(function)
         process_kwargs: dict[str, Any] = {
@@ -301,11 +295,8 @@ async def apply_inlet_filters_if_enabled(
         _inlet_filters_log.warning(f"Error applying inlet filters: {exc}")
     return form_data
 
-
 # --- inlined from src/owui_ext/shared/model_features.py (owui_ext.shared.model_features) ---
 from typing import Optional
-
-
 def _attached_knowledge_types(
     model: Optional[dict],
     metadata: Optional[dict] = None,
@@ -362,11 +353,9 @@ def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
         return True
     return bool(builtin_tools.get("knowledge", True))
 
-
 # --- inlined from src/owui_ext/shared/notifications.py (owui_ext.shared.notifications) ---
 import logging
 from typing import Callable, Optional
-
 _notifications_log = logging.getLogger("owui_ext.shared.notifications")
 
 
@@ -386,13 +375,12 @@ async def emit_notification(
             }
         )
     except Exception as exc:
-        _notifications_log.debug(f"Error emitting notification ({level}): {exc}")
-
+        _notifications_log.debug(
+            f"Error emitting notification ({level}): {exc}"
+        )
 
 # --- inlined from src/owui_ext/shared/prompt_utils.py (owui_ext.shared.prompt_utils) ---
 from typing import Optional
-
-
 def merge_prompt_sections(*sections: Optional[str]) -> str:
     """Join non-empty prompt sections with blank lines."""
     merged_sections = []
@@ -453,7 +441,6 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
     form_data["messages"] = messages
     return form_data
 
-
 # --- inlined from src/owui_ext/shared/tool_execution.py (owui_ext.shared.tool_execution) ---
 import ast
 import json
@@ -461,7 +448,6 @@ import logging
 import uuid
 from typing import Any, Callable, Optional
 from fastapi import Request
-
 _tool_execution_log = logging.getLogger("owui_ext.shared.tool_execution")
 _core_process_tool_result = None
 
@@ -628,7 +614,16 @@ async def emit_terminal_tool_event(
                 parsed = tool_result
         if isinstance(parsed, dict) and parsed.get("exists") is False:
             return
-        event = {"type": "terminal:display_file", "data": {"path": path}}
+        page = tool_function_params.get("page")
+        # NOTE: nested calls cannot produce Core's top-level structured
+        # output pair, so inline requests open the viewer instead.
+        event = {
+            "type": "terminal:display_file",
+            "data": {
+                "path": path,
+                **({"page": page} if page else {}),
+            },
+        }
     elif tool_function_name in {"write_file", "replace_file_content"}:
         path = (
             tool_function_params.get("path", "")
@@ -724,31 +719,27 @@ async def execute_tool_call(
                 # so tool-specific UserValves injected by get_tools() survive.
                 from open_webui.utils.tools import get_updated_tool_function
 
-                tool_function = await _maybe_await(
-                    get_updated_tool_function(
-                        function=tool_function,
-                        extra_params={
-                            "__messages__": extra_params.get("__messages__", []),
-                            "__files__": extra_params.get("__files__", []),
-                            "__event_emitter__": extra_params.get("__event_emitter__"),
-                            "__event_call__": extra_params.get("__event_call__"),
-                        },
-                    )
-                )
+                tool_function = await _maybe_await(get_updated_tool_function(
+                    function=tool_function,
+                    extra_params={
+                        "__messages__": extra_params.get("__messages__", []),
+                        "__files__": extra_params.get("__files__", []),
+                        "__event_emitter__": extra_params.get("__event_emitter__"),
+                        "__event_call__": extra_params.get("__event_call__"),
+                    },
+                ))
 
                 tool_result = await tool_function(**tool_function_params)
 
             tool_type = tool.get("type", "")
-            tool_result, tool_result_files, tool_result_embeds = (
-                await process_tool_result(
-                    tool_function_name=tool_function_name,
-                    tool_type=tool_type,
-                    tool_result=tool_result,
-                    direct_tool=direct_tool,
-                    request=extra_params.get("__request__"),
-                    metadata=extra_params.get("__metadata__"),
-                    user=extra_params.get("__user__"),
-                )
+            tool_result, tool_result_files, tool_result_embeds = await process_tool_result(
+                tool_function_name=tool_function_name,
+                tool_type=tool_type,
+                tool_result=tool_result,
+                direct_tool=direct_tool,
+                request=extra_params.get("__request__"),
+                metadata=extra_params.get("__metadata__"),
+                user=extra_params.get("__user__"),
             )
             emit_terminal_event = True
 
@@ -770,9 +761,7 @@ async def execute_tool_call(
         if event_emitter and tool_result_files:
             await event_emitter({"type": "files", "data": {"files": tool_result_files}})
         if event_emitter and tool_result_embeds:
-            await event_emitter(
-                {"type": "embeds", "data": {"embeds": tool_result_embeds}}
-            )
+            await event_emitter({"type": "embeds", "data": {"embeds": tool_result_embeds}})
 
     if tool_result is None:
         tool_result = ""
@@ -805,14 +794,12 @@ async def execute_tool_call(
         "content": tool_result,
     }
 
-
 # --- inlined from src/owui_ext/shared/mcp_tools.py (owui_ext.shared.mcp_tools) ---
 import asyncio
 import logging
 import re
 from typing import Any, Callable, Optional
 from fastapi import Request
-
 _mcp_tools_log = logging.getLogger("owui_ext.shared.mcp_tools")
 
 
@@ -927,9 +914,7 @@ async def _build_mcp_headers_legacy(
             )
 
             if oauth_token:
-                headers["Authorization"] = (
-                    f'Bearer {oauth_token.get("access_token", "")}'
-                )
+                headers["Authorization"] = f'Bearer {oauth_token.get("access_token", "")}'
         except Exception as e:
             _mcp_tools_log.error(
                 f"Error getting OAuth token for MCP server {server_id}: {e}"
@@ -968,9 +953,7 @@ async def _get_tool_server_connections(request: Request) -> list[dict]:
             )
 
     legacy_connections = (
-        getattr(
-            getattr(request.app.state, "config", None), "TOOL_SERVER_CONNECTIONS", []
-        )
+        getattr(getattr(request.app.state, "config", None), "TOOL_SERVER_CONNECTIONS", [])
         or []
     )
     return legacy_connections if isinstance(legacy_connections, list) else []
@@ -997,7 +980,9 @@ async def resolve_mcp_tools(
         from open_webui.utils.mcp.client import MCPClient
     except ImportError:
         if debug and mcp_tool_ids:
-            _mcp_tools_log.info("MCPClient unavailable; skipping MCP tool resolution")
+            _mcp_tools_log.info(
+                "MCPClient unavailable; skipping MCP tool resolution"
+            )
         return {}, {}
 
     from open_webui.utils.misc import is_string_allowed
@@ -1052,7 +1037,9 @@ async def resolve_mcp_tools(
 
             if not mcp_server_connection.get("config", {}).get("enable", True):
                 if debug:
-                    _mcp_tools_log.info(f"MCP server {server_id} is disabled; skipping")
+                    _mcp_tools_log.info(
+                        f"MCP server {server_id} is disabled; skipping"
+                    )
                 await emit_warning(f"MCP server '{server_id}' is disabled")
                 continue
 
@@ -1159,7 +1146,9 @@ async def resolve_mcp_tools(
                     f"Loaded {loaded_tool_count} MCP tools from server {server_id}"
                 )
         except Exception as e:
-            _mcp_tools_log.warning(f"Failed to load MCP tools from {server_id}: {e}")
+            _mcp_tools_log.warning(
+                f"Failed to load MCP tools from {server_id}: {e}"
+            )
             if client is not None:
                 try:
                     await client.disconnect()
@@ -1187,14 +1176,12 @@ async def cleanup_mcp_clients(mcp_clients: dict) -> None:
         except BaseException as e:
             _mcp_tools_log.debug(f"Error cleaning up MCP client: {e}")
 
-
 # --- inlined from src/owui_ext/shared/tool_servers.py (owui_ext.shared.tool_servers) ---
 import json
 import logging
 from collections.abc import Mapping
 from typing import Any, Optional
 from fastapi import Request
-
 _tool_servers_log = logging.getLogger("owui_ext.shared.tool_servers")
 
 
@@ -1235,9 +1222,7 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
     debug: bool = False,
 ) -> list[dict]:
     """Resolve direct tool servers using core-gated metadata as source of truth."""
-    metadata_has_tool_servers = (
-        isinstance(metadata, dict) and "tool_servers" in metadata
-    )
+    metadata_has_tool_servers = isinstance(metadata, dict) and "tool_servers" in metadata
     if metadata_has_tool_servers:
         return normalize_direct_tool_servers(metadata.get("tool_servers"))
 
@@ -1266,7 +1251,9 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
     return []
 
 
-def build_direct_tools_dict(*, tool_servers: list[dict], debug: bool = False) -> dict:
+def build_direct_tools_dict(
+    *, tool_servers: list[dict], debug: bool = False
+) -> dict:
     """Build direct tool entries compatible with Open WebUI middleware."""
     direct_tools: dict = {}
     for server in tool_servers:
@@ -1338,11 +1325,7 @@ async def resolve_terminal_id_from_request_and_metadata(
                 request_terminal_id = ""
 
     if request_terminal_id:
-        if (
-            debug
-            and metadata_terminal_id
-            and metadata_terminal_id != request_terminal_id
-        ):
+        if debug and metadata_terminal_id and metadata_terminal_id != request_terminal_id:
             _tool_servers_log.warning(
                 "terminal_id mismatch between request body and metadata; "
                 "using request body terminal_id"
@@ -1350,7 +1333,6 @@ async def resolve_terminal_id_from_request_and_metadata(
         return request_terminal_id
 
     return metadata_terminal_id
-
 
 # --- inlined from src/owui_ext/shared/tool_loader.py (owui_ext.shared.tool_loader) ---
 async def build_tools_dict(
@@ -1379,6 +1361,7 @@ async def build_tools_dict(
     avoids re-reading ``request.body()`` when the caller already did
     so for its own bookkeeping.
     """
+    import inspect
     import logging
 
     log = logging.getLogger("owui_ext.shared.tool_loader")
@@ -1387,16 +1370,16 @@ async def build_tools_dict(
     from open_webui.utils.tools import get_builtin_tools, get_tools
 
     try:
-        from open_webui.utils.tools import get_terminal_tools
-    except Exception:
-        get_terminal_tools = None
-
-    try:
         from open_webui.utils.tools import (
             get_attached_knowledge as core_get_attached_knowledge,
         )
     except ImportError:
         core_get_attached_knowledge = None
+
+    try:
+        from open_webui.utils.tools import get_terminal_tools
+    except Exception:
+        get_terminal_tools = None
 
     metadata = metadata or {}
     extra_params = extra_params or {}
@@ -1426,17 +1409,13 @@ async def build_tools_dict(
             extra_metadata = metadata
 
     if resolved_direct_tool_servers is None:
-        direct_tool_servers = (
-            await resolve_direct_tool_servers_from_request_and_metadata(
-                request=request,
-                metadata=metadata,
-                debug=debug,
-            )
+        direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
+            request=request,
+            metadata=metadata,
+            debug=debug,
         )
     else:
-        direct_tool_servers = normalize_direct_tool_servers(
-            resolved_direct_tool_servers
-        )
+        direct_tool_servers = normalize_direct_tool_servers(resolved_direct_tool_servers)
 
     if direct_tool_servers:
         metadata["tool_servers"] = direct_tool_servers
@@ -1450,9 +1429,7 @@ async def build_tools_dict(
     # split them out and resolve via resolve_mcp_tools().
     regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
     if excluded_tool_ids:
-        regular_tool_ids = [
-            tid for tid in regular_tool_ids if tid not in excluded_tool_ids
-        ]
+        regular_tool_ids = [tid for tid in regular_tool_ids if tid not in excluded_tool_ids]
 
     mcp_tool_ids = [tid for tid in regular_tool_ids if tid.startswith("server:mcp:")]
     non_mcp_tool_ids = [
@@ -1584,13 +1561,9 @@ async def build_tools_dict(
             if direct_tools:
                 duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
                 tools_dict = {**tools_dict, **direct_tools}
-                direct_tool_server_prompts = extract_direct_tool_server_prompts(
-                    direct_tools
-                )
+                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
                 if direct_tool_server_prompts:
-                    extra_params["__direct_tool_server_system_prompts__"] = (
-                        direct_tool_server_prompts
-                    )
+                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
                 else:
                     extra_params.pop("__direct_tool_server_system_prompts__", None)
                 if debug:
@@ -1630,16 +1603,45 @@ async def build_tools_dict(
             "__oauth_token__": extra_params.get("__oauth_token__"),
         }
 
-        all_builtin_tools = await maybe_await(
-            get_builtin_tools(
-                request=request,
-                extra_params=builtin_extra_params,
-                features=features,
-                model=model,
+        builtin_kwargs = {
+            "request": request,
+            "extra_params": builtin_extra_params,
+            "features": features,
+            "model": model,
+        }
+        try:
+            supports_note_chat = (
+                "is_note_chat" in inspect.signature(get_builtin_tools).parameters
             )
-        )
+        except (TypeError, ValueError):
+            supports_note_chat = False
+        if supports_note_chat:
+            from open_webui.models.chats import Chats
+            from open_webui.utils.chat_id import is_saved_chat_id
 
-        disabled_builtin_tools: set = set()
+            chat_id = metadata.get("chat_id")
+            chat = (
+                await maybe_await(Chats.get_chat_by_id(chat_id))
+                if is_saved_chat_id(chat_id)
+                else None
+            )
+            builtin_kwargs["is_note_chat"] = bool(
+                chat
+                and (chat.meta or {}).get("internal") is True
+                and (chat.meta or {}).get("type") == "note"
+            )
+
+        all_builtin_tools = await maybe_await(get_builtin_tools(**builtin_kwargs))
+
+        # NOTE: ask_user is excluded from nested loops. The callable itself
+        # would work over __event_call__, but the frontend keeps a single
+        # event callback, so concurrent request:user_input calls from
+        # parallel branches clobber each other and the losing call waits
+        # forever (Core overrides sio.call's 60s default timeout with
+        # WEBSOCKET_EVENT_CALLER_TIMEOUT, which defaults to None).
+        disabled_builtin_tools: set = set(
+            BUILTIN_TOOL_CATEGORIES.get("user_input", set())
+        )
         for valve_field, categories in VALVE_TO_CATEGORY.items():
             if not getattr(valves, valve_field, True):
                 for category in categories:
@@ -1714,18 +1716,18 @@ async def build_tools_dict(
 
     return tools_dict, mcp_clients
 
-
 # --- inlined from src/owui_ext/shared/skills.py (owui_ext.shared.skills) ---
 import logging
 import re
 from typing import Any, Optional
 from fastapi import Request
-
 _skills_log = logging.getLogger("owui_ext.shared.skills")
 
 _SKILLS_MANIFEST_START = "<available_skills>"
 _SKILLS_MANIFEST_END = "</available_skills>"
-_SKILL_TAG_PATTERN = re.compile(r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL)
+_SKILL_TAG_PATTERN = re.compile(
+    r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL
+)
 
 
 async def _skills_maybe_await(value: Any) -> Any:
@@ -1771,21 +1773,17 @@ def _extract_from_system_messages(
         if isinstance(content, str):
             found = extractor(content)
             if found:
-                (
-                    results.append(found)
-                    if isinstance(found, str)
-                    else results.extend(found)
+                results.append(found) if isinstance(found, str) else results.extend(
+                    found
                 )
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     found = extractor(part.get("text") or "")
                     if found:
-                        (
-                            results.append(found)
-                            if isinstance(found, str)
-                            else results.extend(found)
-                        )
+                        results.append(found) if isinstance(
+                            found, str
+                        ) else results.extend(found)
     return results
 
 
@@ -1855,20 +1853,18 @@ async def register_view_skill(
             convert_pydantic_model_to_openai_function_spec,
         )
 
-        callable_fn = await _skills_maybe_await(
-            get_async_tool_function_and_apply_extra_params(
-                view_skill,
-                {
-                    "__request__": request,
-                    "__user__": extra_params.get("__user__", {}),
-                    "__event_emitter__": extra_params.get("__event_emitter__"),
-                    "__event_call__": extra_params.get("__event_call__"),
-                    "__metadata__": extra_params.get("__metadata__"),
-                    "__chat_id__": extra_params.get("__chat_id__"),
-                    "__message_id__": extra_params.get("__message_id__"),
-                },
-            )
-        )
+        callable_fn = await _skills_maybe_await(get_async_tool_function_and_apply_extra_params(
+            view_skill,
+            {
+                "__request__": request,
+                "__user__": extra_params.get("__user__", {}),
+                "__event_emitter__": extra_params.get("__event_emitter__"),
+                "__event_call__": extra_params.get("__event_call__"),
+                "__metadata__": extra_params.get("__metadata__"),
+                "__chat_id__": extra_params.get("__chat_id__"),
+                "__message_id__": extra_params.get("__message_id__"),
+            },
+        ))
 
         pydantic_model = convert_function_to_pydantic_model(view_skill)
         spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
@@ -1882,12 +1878,9 @@ async def register_view_skill(
     except Exception as e:
         _skills_log.warning(f"Failed to register view_skill: {e}")
 
-
 # --- inlined from src/owui_ext/shared/valves.py (owui_ext.shared.valves) ---
 from typing import Any, Type
 from pydantic import BaseModel
-
-
 def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
     """Normalize raw user valves into the target valves class.
 
@@ -1909,7 +1902,6 @@ def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseMode
         return valves_cls.model_validate(raw_valves)
     return valves_cls.model_validate({})
 
-
 log = logging.getLogger(__name__)
 
 
@@ -1929,9 +1921,7 @@ class SubAgentTaskItem(BaseModel):
 # ============================================================================
 
 
-def normalize_parallel_sub_agent_tasks(
-    tasks: Any,
-) -> tuple[Optional[list[dict[str, str]]], Optional[str]]:
+def normalize_parallel_sub_agent_tasks(tasks: Any) -> tuple[Optional[list[dict[str, str]]], Optional[str]]:
     """Normalize raw parallel task payloads into validated dicts."""
     if not isinstance(tasks, list):
         return (
@@ -1957,9 +1947,7 @@ def normalize_parallel_sub_agent_tasks(
                     return (
                         None,
                         json.dumps(
-                            {
-                                "error": f"tasks[{i}] must be an object, got unparseable string"
-                            },
+                            {"error": f"tasks[{i}] must be an object, got unparseable string"},
                             ensure_ascii=False,
                         ),
                     )
@@ -2138,9 +2126,7 @@ async def run_sub_agent_loop(
             "metadata": {
                 "task": "sub_agent",
                 "sub_agent_iteration": iteration,
-                "filter_ids": extra_params.get("__metadata__", {}).get(
-                    "filter_ids", []
-                ),
+                "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
             },
         }
 
@@ -2205,9 +2191,7 @@ async def run_sub_agent_loop(
                 return content or ""
 
             # Normalize: filter out non-mapping entries from tool_calls
-            if not isinstance(tool_calls, Sequence) or isinstance(
-                tool_calls, (str, bytes)
-            ):
+            if not isinstance(tool_calls, Sequence) or isinstance(tool_calls, (str, bytes)):
                 return (
                     f"API returned malformed response: tool_calls is "
                     f"{type(tool_calls).__name__}, not a sequence. "
@@ -2227,11 +2211,7 @@ async def run_sub_agent_loop(
             # Emit status with tool calls summary
             if event_emitter:
                 tool_names = [
-                    (
-                        tc["function"].get("name", "unknown")
-                        if isinstance(tc.get("function"), Mapping)
-                        else "malformed"
-                    )
+                    tc["function"].get("name", "unknown") if isinstance(tc.get("function"), Mapping) else "malformed"
                     for tc in tool_calls
                 ]
                 await event_emitter(
@@ -2255,12 +2235,10 @@ async def run_sub_agent_loop(
                         args = json.dumps(args, ensure_ascii=False)
                     except Exception:
                         args = str(args)
-                normalized_tool_calls.append(
-                    {
-                        **tc,
-                        "function": {**tc_func, "arguments": args},
-                    }
-                )
+                normalized_tool_calls.append({
+                    **tc,
+                    "function": {**tc_func, "arguments": args},
+                })
             if not normalized_tool_calls:
                 return (
                     f"API returned malformed response: all tool_calls had invalid "
@@ -2278,14 +2256,8 @@ async def run_sub_agent_loop(
             # Execute each tool call
             for tool_call in normalized_tool_calls:
                 tc_func = tool_call.get("function")
-                tool_args_raw = (
-                    tc_func.get("arguments", "{}")
-                    if isinstance(tc_func, dict)
-                    else "{}"
-                )
-                tool_args_display = (
-                    str(tool_args_raw).replace(chr(10), " ") if tool_args_raw else "{}"
-                )
+                tool_args_raw = tc_func.get("arguments", "{}") if isinstance(tc_func, dict) else "{}"
+                tool_args_display = str(tool_args_raw).replace(chr(10), " ") if tool_args_raw else "{}"
 
                 if event_emitter:
                     await event_emitter(
@@ -2310,11 +2282,7 @@ async def run_sub_agent_loop(
 
                 # Emit status with tool result
                 if event_emitter:
-                    result_content = (
-                        result["content"].replace(chr(10), " ")
-                        if result["content"]
-                        else "(empty)"
-                    )
+                    result_content = result["content"].replace(chr(10), ' ') if result["content"] else "(empty)"
                     await event_emitter(
                         {
                             "type": "status",
@@ -2438,7 +2406,9 @@ async def load_sub_agent_tools(
         log.info(f"[SubAgent] Available tool_ids from metadata: {available_tool_ids}")
         log.info(f"[SubAgent] self_tool_id: {self_tool_id}")
         log.info(f"[SubAgent] resolved terminal_id: {terminal_id}")
-        log.info(f"[SubAgent] resolved direct tool servers: {len(direct_tool_servers)}")
+        log.info(
+            f"[SubAgent] resolved direct tool servers: {len(direct_tool_servers)}"
+        )
 
     excluded: set = set()
     if valves.EXCLUDED_TOOL_IDS.strip():
@@ -2458,9 +2428,7 @@ async def load_sub_agent_tools(
     if debug:
         log.info(f"[SubAgent] EXCLUDED_TOOL_IDS valve: '{valves.EXCLUDED_TOOL_IDS}'")
         if excluded:
-            log.info(
-                f"[SubAgent] Excluded tool IDs (including self): {sorted(excluded)}"
-            )
+            log.info(f"[SubAgent] Excluded tool IDs (including self): {sorted(excluded)}")
 
     if valves.AVAILABLE_TOOL_IDS.strip():
         tool_id_list = [
@@ -2756,11 +2724,6 @@ RESPONSE REQUIREMENTS:
         you MUST NOT perform it yourself. Delegate to this tool immediately.
         Only handle simple 1-2 tool call tasks yourself. When in doubt, delegate.
 
-
-        The sub-agent may not have access to tools that make changes, such as `run_command`, `add_memory`, `write_file`, etc.
-        Avoid spawning sub-agents for making changes; make changes yourself while relying on
-        sub-agents for investigation and complex analysis.
-        
         The sub-agent runs in a fresh context with NO access to the current
         conversation history — include all necessary context in the prompt.
         It has the same tools and executes them in a loop until completion,
@@ -3082,8 +3045,7 @@ RESPONSE REQUIREMENTS:
                     parallel_prompt_sections.append(skill_manifest)
             parallel_system_content = merge_prompt_sections(*parallel_prompt_sections)
             task_mapping = ", ".join(
-                f"[{i + 1}] {task['description']}"
-                for i, task in enumerate(validated_tasks)
+                f"[{i + 1}] {task['description']}" for i, task in enumerate(validated_tasks)
             )
 
             if __event_emitter__:
@@ -3116,9 +3078,7 @@ RESPONSE REQUIREMENTS:
                             prefixed_data["description"] = (
                                 f"[{task_index}] {original_description}"
                             )
-                        await __event_emitter__(
-                            {"type": "status", "data": prefixed_data}
-                        )
+                        await __event_emitter__({"type": "status", "data": prefixed_data})
                         return
 
                     await __event_emitter__(event)
@@ -3134,14 +3094,12 @@ RESPONSE REQUIREMENTS:
                         ],
                         tools_dict=tools_dict,
                         max_iterations=self.valves.MAX_ITERATIONS,
-                        event_emitter=(
-                            indexed_event_emitter if __event_emitter__ else None
-                        ),
+                        event_emitter=indexed_event_emitter if __event_emitter__ else None,
                         extra_params={
                             **common_extra_params,
-                            "__event_emitter__": (
-                                indexed_event_emitter if __event_emitter__ else None
-                            ),
+                            "__event_emitter__": indexed_event_emitter
+                            if __event_emitter__
+                            else None,
                         },
                         apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                         iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
