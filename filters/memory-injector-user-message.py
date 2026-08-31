@@ -2,7 +2,7 @@
 title: Memory Injector — User Message
 author: Airi V
 description: Drop-in replacement for Open WebUI's built-in memory injection (add_memory_context) that renders the same [User Memory] / [Memory Neighborhood] / [Relevant Context] block but injects it into a USER message at a configurable position instead of the system message — keeping the system-message prefix stable for prompt caching. Ported from the v0.11.0 middleware pipeline (utils/memory.py add_memory_context), with the same gates, retrieval, dedup and char limits.
-version: 1.0.3
+version: 1.0.4
 """
 # v1.0.1: default priority 10 (runs after time-awareness, whose parser-based
 # container update breaks when another filter's block is already present); the
@@ -389,7 +389,7 @@ class Filter:
         self.valves = self.Valves()
         self.uservalves = self.UserValves()
 
-    # -- retrieval + rendering: faithful port of v0.11.0 add_memory_context --
+    # -- retrieval + rendering: faithful port of v0.11.1 add_memory_context --
     async def _build_memory_context(self, body: dict, request, user_id: str) -> str | None:
         """Reproduce the built-in memory-context render. Returns the wrapped
         block (<memory_context>…</memory_context>) or None when there is
@@ -448,7 +448,7 @@ class Filter:
             seen_ids = set()
             for memory in sorted(
                 [m for m in all_memories if m.type == "user"],
-                key=lambda item: (item.path or "", item.updated_at),
+                key=lambda item: (item.path or "", item.updated_at or 0, item.id or ""),
             ):
                 seen_ids.add(memory.id)
                 sections["user"].append(_safe_label(memory_label(memory)))
@@ -503,21 +503,18 @@ class Filter:
 
         # 5. Render with per-section char limits (same split + truncation as
         #    the built-in: user section gets user_limit, the rest context_limit).
+        # v0.11.1: the built-in now sorts each section's labels alphabetically
+        # before rendering (stable order, #28292) — mirror it exactly so the
+        # injected block matches the backend's current behavior.
         parts = []
-        if sections["user"]:
-            parts.append(
-                "[User Memory]\n" + "\n".join(f"- {m}" for m in sections["user"])
-            )
-        if sections["neighborhood"]:
-            parts.append(
-                "[Memory Neighborhood]\n"
-                + "\n".join(f"- {m}" for m in sections["neighborhood"])
-            )
-        if sections["context"]:
-            parts.append(
-                "[Relevant Context]\n"
-                + "\n".join(f"- {m}" for m in sections["context"])
-            )
+        for title, key in (
+            ("User Memory", "user"),
+            ("Memory Neighborhood", "neighborhood"),
+            ("Relevant Context", "context"),
+        ):
+            if sections[key]:
+                ordered = sorted(sections[key], key=lambda m: (m.casefold(), m))
+                parts.append(f"[{title}]\n" + "\n".join(f"- {m}" for m in ordered))
         if not parts:
             return None
 
