@@ -1,7 +1,7 @@
 """
 title: Chat & Folder Management
-author: Airi V
-version: 1.2.3
+author: Airi V (with guidance from Destiny)
+version: 1.3.0
 description: A complete suite of tools for organising conversations — rename, archive, move between folders,
              create/rename/delete folders, and advanced chat search with folder-aware filtering.
              Works in both normal chat and Automation contexts.
@@ -10,6 +10,12 @@ description: A complete suite of tools for organising conversations — rename, 
              (delete_chat / delete_folder) without losing the rest of the tool.
              Supports subfolders — every folder-name-based method accepts parent_folder_name for
              disambiguation when the same folder name exists at different levels.
+
+             v1.3.0: search_chats_advanced now reports turn_count per result — the number of
+                     user + assistant messages in the chat (tool/system roles excluded, so
+                     tool-heavy automations don't inflate it). A true background automation
+                     has exactly 2 turns (1 user + 1 agent); more than 2 means the chat was
+                     followed up with live conversation — never classify by folder alone.
 
              v1.2.3: search_chats_advanced no longer crashes on empty query + timestamp filters.
                      Uses get_chats_by_user_id (full ChatModel) instead of
@@ -703,7 +709,8 @@ class Tools:
         :param include_archived: If True, also search archived chats (default: False).
         :param start_timestamp: Only include chats updated after this Unix timestamp (seconds).
         :param end_timestamp: Only include chats updated before this Unix timestamp (seconds).
-        :return: JSON array of matching chats with id, title, folder, snippet, and updated_at.
+        :return: JSON array of matching chats with id, title, folder, snippet, updated_at,
+                   and turn_count (user + assistant messages; a true automation = 2).
         """
         denied = self._check("enable_search_chats_advanced")
         if denied:
@@ -796,8 +803,20 @@ class Tools:
 
                 # Extract snippet
                 snippet = ""
-                messages = chat.chat.get("history", {}).get("messages", {})
+                messages = chat.chat.get("history", {}).get("messages", {}) or {}
                 lower_query = query.lower()
+
+                # Turn count: user + assistant messages only. Tool/system roles
+                # are excluded so a tool-heavy automation doesn't inflate the
+                # count. A true background automation has exactly 2 turns
+                # (1 user + 1 agent); more than 2 means the chat was followed
+                # up with live conversation.
+                turn_count = sum(
+                    1 for m in messages.values()
+                    if m.get("role") in ("user", "assistant")
+                )
+                if turn_count == 0 and messages:
+                    turn_count = len(messages)  # legacy messages without a role field
 
                 for msg_id, msg in messages.items():
                     content = msg.get("content", "")
@@ -820,6 +839,7 @@ class Tools:
                     "title": chat.title,
                     "folder": chat_folder_name,
                     "snippet": snippet,
+                    "turn_count": turn_count,
                     "updated_at": chat.updated_at,
                 })
 
