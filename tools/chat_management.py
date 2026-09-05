@@ -1,7 +1,7 @@
 """
 title: Chat & Folder Management
 author: Airi V (with guidance from Destiny)
-version: 1.3.0
+version: 1.4.0
 description: A complete suite of tools for organising conversations — rename, archive, move between folders,
              create/rename/delete folders, and advanced chat search with folder-aware filtering.
              Works in both normal chat and Automation contexts.
@@ -10,6 +10,13 @@ description: A complete suite of tools for organising conversations — rename, 
              (delete_chat / delete_folder) without losing the rest of the tool.
              Supports subfolders — every folder-name-based method accepts parent_folder_name for
              disambiguation when the same folder name exists at different levels.
+
+             v1.4.0: search_chats_advanced accepts an optional `title` parameter — a
+                     case-insensitive substring match against chat titles. Finds a chat by
+                     what it's CALLED when the contents aren't known: query is now optional,
+                     so a title alone can drive the search. When both are given, results must
+                     satisfy both filters. Title matches rank ahead of content matches in the
+                     underlying search.
 
              v1.3.0: search_chats_advanced now reports turn_count per result — the number of
                      user + assistant messages in the chat (tool/system roles excluded, so
@@ -680,7 +687,8 @@ class Tools:
 
     async def search_chats_advanced(
         self,
-        query: str,
+        query: Optional[str] = None,
+        title: Optional[str] = None,
         count: int = 10,
         folder_name: Optional[str] = None,
         parent_folder_name: Optional[str] = None,
@@ -696,9 +704,14 @@ class Tools:
         Advanced chat search with folder-aware filtering.
 
         Use this when you need to find conversations within a specific folder,
-        exclude a folder, or apply more precise filters than the built-in search_chats.
+        exclude a folder, apply more precise filters than the built-in search_chats,
+        or find a chat by its TITLE when you don't know what's inside it.
 
         :param query: Search text to match against chat titles and messages.
+                      Omit (or pass empty) when searching by title alone.
+        :param title: Optional. Case-insensitive substring to match against chat titles.
+                      Use when you know what a chat is CALLED but not what's in it.
+                      If query is also given, both filters apply — results must match both.
         :param count: Maximum number of results to return (default: 10).
         :param folder_name: If set, only search within this folder.
         :param parent_folder_name: If folder_name is ambiguous, disambiguate by specifying
@@ -724,6 +737,12 @@ class Tools:
             return json.dumps({"status": "error", "message": "User context not available."})
 
         try:
+            # Normalise the two search dimensions. query matches chat content (and titles,
+            # via the DB search); title is a pure case-insensitive substring filter applied
+            # in Python after a DB pre-filter. When both are given, both filters apply.
+            query_terms = query.strip() if query else None
+            title_sub = title.strip().lower() if title else None
+
             # Resolve folder IDs for include/exclude with required semantics
             include_folder_id = None
             if folder_name:
@@ -751,10 +770,23 @@ class Tools:
             # ChatTitleIdResponse objects WITHOUT folder_id or chat fields.
             # Use get_chats_by_user_id — which returns full ChatModel objects —
             # for the empty-query case instead.
-            if query and query.strip():
+            if query_terms:
                 chats = await Chats.get_chats_by_user_id_and_search_text(
                     user_id=user_id,
-                    search_text=query,
+                    search_text=query_terms,
+                    include_archived=include_archived,
+                    skip=0,
+                    limit=count * 3,
+                )
+            elif title_sub:
+                # Pure-title search: hand the title phrase to the DB search. It matches
+                # `title ilike %phrase%` and ranks exact-title matches first, so true
+                # title hits surface ahead of content noise AND old chats are not missed
+                # by a recency-limited fetch. Over-broad content matches are filtered
+                # out by the title_sub check in the loop below.
+                chats = await Chats.get_chats_by_user_id_and_search_text(
+                    user_id=user_id,
+                    search_text=title_sub,
                     include_archived=include_archived,
                     skip=0,
                     limit=count * 3,
@@ -776,6 +808,10 @@ class Tools:
                 # Skip the current chat to avoid showing it in search results.
                 # This matches the behaviour of the built-in search_chats tool.
                 if __chat_id__ and chat.id == __chat_id__:
+                    continue
+
+                # Post-filter: title substring (case-insensitive)
+                if title_sub and title_sub not in chat.title.lower():
                     continue
 
                 # Post-filter: include only specific folder
@@ -801,10 +837,11 @@ class Tools:
                     if folder:
                         chat_folder_name = folder.name
 
-                # Extract snippet
+                # Extract snippet — only meaningful when a content query is present;
+                # a pure-title search has no content context worth showing.
                 snippet = ""
                 messages = chat.chat.get("history", {}).get("messages", {}) or {}
-                lower_query = query.lower()
+                lower_query = query_terms.lower() if query_terms else None
 
                 # Turn count: user + assistant messages only. Tool/system roles
                 # are excluded so a tool-heavy automation doesn't inflate the
@@ -818,21 +855,22 @@ class Tools:
                 if turn_count == 0 and messages:
                     turn_count = len(messages)  # legacy messages without a role field
 
-                for msg_id, msg in messages.items():
-                    content = msg.get("content", "")
-                    if isinstance(content, str) and lower_query in content.lower():
-                        idx = content.lower().find(lower_query)
-                        start = max(0, idx - 50)
-                        end = min(len(content), idx + len(query) + 100)
-                        snippet = (
-                            ("..." if start > 0 else "")
-                            + content[start:end]
-                            + ("..." if end < len(content) else "")
-                        )
-                        break
+                if lower_query:
+                    for msg_id, msg in messages.items():
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and lower_query in content.lower():
+                            idx = content.lower().find(lower_query)
+                            start = max(0, idx - 50)
+                            end = min(len(content), idx + len(query_terms) + 100)
+                            snippet = (
+                                ("..." if start > 0 else "")
+                                + content[start:end]
+                                + ("..." if end < len(content) else "")
+                            )
+                            break
 
-                if not snippet and lower_query in chat.title.lower():
-                    snippet = f"Title match: {chat.title}"
+                    if not snippet and lower_query in chat.title.lower():
+                        snippet = f"Title match: {chat.title}"
 
                 results.append({
                     "id": chat.id,
